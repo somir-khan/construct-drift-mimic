@@ -1,0 +1,29 @@
+# Python standard exclusions
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+
+# Data and Clinical files (CRITICAL: Private Data Protection)
+data/
+*.csv
+*.parquet
+*.h5
+
+figures_pipeline/
+outputs/
+visualizations/figures/*.pdf
+visualizations/figures/*.png
+
+# Environment and Secrets
+.env
+.env.local
+
+
+# OS specific
+.DS_Store
+Thumbs.db

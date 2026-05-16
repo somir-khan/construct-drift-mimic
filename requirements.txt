@@ -1,0 +1,14 @@
+pandas
+numpy
+scikit-learn
+torch
+transformers
+matplotlib
+seaborn
+torchdrift
+dataeval
+# For Judge LLM if needed later
+openai
+ollama
+python-dotenv
+PyPDF2
