@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
-_CSV = os.path.abspath(os.path.join(_DIR, '..', '..', 'outputs', 'surface_features_by_period.csv'))
+_CSV = os.path.abspath(os.path.join(_DIR, '..', 'outputs', 'surface_features_by_period.csv'))
 
 plt.rcParams.update({
     'font.family':       'sans-serif',
@@ -111,7 +111,7 @@ _format_panel(ax_c, '(c)', windows)
 
 ax_d.set_facecolor('#f5f5f5')
 bars = ax_d.bar(x, df['numeric_density'], color='#999999', alpha=0.75, width=0.6)
-ax_d.set_ylim(0.085, 0.105)
+ax_d.set_ylim(0.0, 0.12)
 ax_d.set_ylabel('Proportion of numeric tokens')
 for bar, v in zip(bars, df['numeric_density']):
     ax_d.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),

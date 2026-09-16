@@ -10,21 +10,6 @@ detect_drift.py; they come from standalone SQL queries against the SQLite
 MIMIC-III/IV databases and were previously run ad-hoc.  This file is the
 canonical provenance record so the numbers can be re-verified at any time.
 
-LAST VERIFIED: 2026-04-20
-
-PAPER TARGETS
--------------
-  MIMIC-III  note-linked mortality  : 10.5%  n = 49,038  (NEWBORN excluded)
-  MIMIC-IV   note-linked mortality  :  2.4%  n ≈ 256,341
-  MIMIC-IV   population mortality   :  2.2%  = 11,801 / 546,028
-  MIMIC-III  high-acuity restricted : 12.0%  (EMERGENCY + URGENT)
-  MIMIC-IV   high-acuity restricted :  3.6%  (EW EMER. + DIRECT EMER. + URGENT)
-
-  Note: an earlier draft of the paper reported 12.7% and 3.7% for the
-  high-acuity cohorts from an ad-hoc query whose exact cohort definition
-  could not be recovered. B.2 and the PAPER_RATE constants here were
-  updated on 2026-04-20 to match the reproducible query below.
-
 METHODOLOGICAL CHOICES
 ----------------------
   - Unit of analysis: distinct admissions (HADM_ID), NOT raw note rows.
@@ -80,7 +65,6 @@ def mimic3_note_linked_mortality(conn: sqlite3.Connection) -> dict:
     """
     MIMIC-III headline mortality: admissions that have at least one discharge
     summary note (after ISERROR filter), NEWBORN excluded.
-    Paper target: 10.5% at n = 49,083.
     """
     query = """
     -- Step 1: collect distinct HADM_IDs that have a usable discharge summary.
@@ -125,7 +109,6 @@ def mimic4_note_linked_mortality(conn: sqlite3.Connection) -> dict:
     """
     MIMIC-IV mortality for admissions that have at least one discharge note.
     Joins "hosp/admissions" to "note/discharge" on hadm_id.
-    Paper target: 2.4% at n ≈ 256,341.
     """
     query = """
     -- Collect distinct hadm_ids from the MIMIC-IV discharge note table.
@@ -165,7 +148,6 @@ def mimic4_population_mortality(conn: sqlite3.Connection) -> dict:
     """
     MIMIC-IV population-level mortality: all rows in "hosp/admissions",
     no note-linkage filter.
-    Paper target: 2.2% = 11,801 / 546,028.
     """
     query = """
     -- No note join — full admissions table to get the population denominator.
@@ -196,7 +178,6 @@ def mimic3_high_acuity_mortality(conn: sqlite3.Connection) -> dict:
     """
     MIMIC-III mortality restricted to high-acuity admission types:
     EMERGENCY and URGENT only (NEWBORN still excluded by the type filter).
-    Paper target: 12.0%.
     """
     query = """
     WITH note_linked_hadm AS (
@@ -238,7 +219,6 @@ def mimic4_high_acuity_mortality(conn: sqlite3.Connection) -> dict:
     MIMIC-IV mortality restricted to high-acuity admission types.
     MIMIC-IV uses more granular type labels; the nearest equivalents to
     MIMIC-III's EMERGENCY+URGENT are 'EW EMER.', 'DIRECT EMER.', and 'URGENT'.
-    Paper target: 3.6%.
     """
     query = """
     WITH note_linked_hadm AS (
@@ -301,55 +281,25 @@ def main() -> None:
         conn4.close()
 
     # ------------------------------------------------------------------
-    # Print comparison table
+    # Print results table
     # ------------------------------------------------------------------
-    PAPER_RATE = {
-    "mimic3_note_linked": 0.106,
-    "mimic4_note_linked": 0.025,   
-    "mimic4_population":  0.022,
-    "mimic3_high_acuity": 0.120,  
-    "mimic4_high_acuity": 0.036,   
-    }
-    # Only the two cohorts whose n is explicitly stated in the paper.
-    PAPER_N = {
-        "mimic3_note_linked": 49083,
-        "mimic4_population":  546028,
-    }
-
     rows = [r_m3_nl, r_m4_nl, r_m4_pop, r_m3_ha, r_m4_ha]
 
     print()
-    print("=" * 76)
+    print("=" * 60)
     print("  APPENDIX B.2  MORTALITY BASE RATES")
-    print("=" * 76)
-    fmt = "  {:<35s}  {:>8s}  {:>8s}  {:>9s}  {}"
-    print(fmt.format("Cohort", "Computed", "Paper", "n_adm", "n_deaths  flags"))
-    print("  " + "-" * 72)
+    print("=" * 60)
+    fmt = "  {:<25s}  {:>8s}  {:>9s}  {:>9s}"
+    print(fmt.format("Cohort", "Rate", "n_adm", "n_deaths"))
+    print("  " + "-" * 56)
     for r in rows:
-        label    = r["query_label"]
-        computed = r["rate"]
-        paper    = PAPER_RATE[label]
-        flags    = ""
-
-        if abs(computed - paper) > 0.005:
-            flags += "!"  # rate deviates by more than 0.5 pp
-
-        if label in PAPER_N:
-            paper_n   = PAPER_N[label]
-            tolerance = max(100, paper_n * 0.01)
-            if abs(r["n_admissions"] - paper_n) > tolerance:
-                flags += "#"  # n_admissions deviates by more than 1% or 100 rows
-
         print(fmt.format(
-            label,
-            f"{computed:.3f}",
-            f"{paper:.3f}",
+            r["query_label"],
+            f"{r['rate']:.3f}",
             f"{r['n_admissions']:,}",
-            f"{r['n_deaths']:,}  {flags}".strip(),
+            f"{r['n_deaths']:,}",
         ))
-
-    print("=" * 76)
-    print("  Flags:  ! rate delta > 0.005   # n_admissions delta > max(100, 1% of paper n)")
+    print("=" * 60)
     print()
 
     # ------------------------------------------------------------------

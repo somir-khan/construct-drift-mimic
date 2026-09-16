@@ -10,17 +10,16 @@ each window independently for downstream semantic classification by the Judge LL
 The witness function w(x) = E_P[k(x,x')] - E_Q[k(x,y)] assigns high scores
 to target samples that are most "alien" to the baseline distribution.
 
-PCA handling: baseline_pca.npy is already 50-dim. Window embeddings are raw 768-dim
-and are compressed using the PCA object saved by detect_drift.py (loaded via joblib).
+PCA handling: baseline_pca.npy is already compressed (52 dimensions in the
+reported run). Window embeddings are raw 768-dimensional arrays and are
+compressed using the PCA object saved by detect_drift.py (loaded via joblib).
 
 Usage:
-    python scripts/select_judge_samples.py
-    python scripts/select_judge_samples.py --n-select 10 --rng-seed 0
     python scripts/select_judge_samples.py \\
         --baseline-pca data/baseline_pca.npy \\
-        --baseline-raw data/embeddings/embeddings_mimic3_5000.npy \\
-        --pca-model    data/pca_model.pkl \\
-        --samples-csv  data/judge_samples.csv
+        --pca-model data/pca_model.pkl \\
+        --n-select 50 --n-exemplars 3 --subsample 1000 --rng-seed 42 \\
+        --samples-csv data/judge_samples_300.csv
 """
 
 import argparse
@@ -64,15 +63,7 @@ def parse_args():
     parser.add_argument(
         "--baseline-pca",
         default="data/baseline_pca.npy",
-        help="Path to MIMIC-III PCA embeddings (.npy, shape N×50, already compressed).",
-    )
-    parser.add_argument(
-        "--baseline-raw",
-        default="data/embeddings/embeddings_mimic3_5000.npy",
-        help=(
-            "Path to raw MIMIC-III embeddings (.npy, shape N×768). Used only to load "
-            "hadm_ids for centroid exemplar selection; PCA is loaded from --pca-model."
-        ),
+        help="Path to MIMIC-III PCA embeddings (.npy, shape N×d, already compressed).",
     )
     parser.add_argument(
         "--baseline-ids",
@@ -117,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--n-select",
         type=int,
-        default=10,
+        default=50,
         help="Number of notes to select per group (top / bottom / random) per window.",
     )
     parser.add_argument(
@@ -272,7 +263,7 @@ def main():
     """Orchestrate two-window witness-score computation and stratified sample selection."""
     args = parse_args()
 
-    # --- Stage 1: Load baseline PCA (already 50-dim) ------------------------
+    # --- Stage 1: Load the already-compressed baseline PCA -------------------
     log.info("--- Stage 1: Load Baseline PCA ---")
     if not os.path.exists(args.baseline_pca):
         log.error("File not found: %s  (baseline PCA)", args.baseline_pca)
@@ -295,6 +286,9 @@ def main():
             len(baseline_ids), len(X_base),
         )
         sys.exit(1)
+    if len(np.unique(baseline_ids)) != len(baseline_ids):
+        log.error("baseline_ids contains duplicate admission identifiers.")
+        sys.exit(1)
 
     centroid = X_base.mean(axis=0)
     dists = np.linalg.norm(X_base - centroid, axis=1)
@@ -314,11 +308,23 @@ def main():
 
     placeholders = ",".join("?" * len(exemplar_hadm_ids))
     query_exemplars = f"""
+        WITH ranked AS (
+            SELECT
+                HADM_ID,
+                TEXT,
+                ROW_NUMBER() OVER (
+                    PARTITION BY HADM_ID
+                    ORDER BY CHARTDATE DESC, ROW_ID DESC
+                ) AS rn
+            FROM NOTEEVENTS
+            WHERE HADM_ID IN ({placeholders})
+              AND CATEGORY = 'Discharge summary'
+              AND (ISERROR IS NULL OR ISERROR != '1')
+              AND TEXT IS NOT NULL
+        )
         SELECT HADM_ID, TEXT
-        FROM NOTEEVENTS
-        WHERE HADM_ID IN ({placeholders})
-          AND CATEGORY = 'Discharge summary'
-          AND (ISERROR IS NULL OR ISERROR != '1')
+        FROM ranked
+        WHERE rn = 1
     """
     conn3 = sqlite3.connect(MIMIC3_DB_PATH)
     df_exemplars_raw = pd.read_sql_query(
@@ -326,8 +332,17 @@ def main():
     )
     conn3.close()
 
-    if len(df_exemplars_raw) == 0:
-        log.error("No MIMIC-III notes found for exemplar hadm_ids: %s", exemplar_hadm_ids)
+    retrieved_exemplar_ids = set(df_exemplars_raw["HADM_ID"].astype(np.int64))
+    expected_exemplar_ids = {int(value) for value in exemplar_hadm_ids}
+    if (
+        len(df_exemplars_raw) != args.n_exemplars
+        or retrieved_exemplar_ids != expected_exemplar_ids
+    ):
+        log.error(
+            "Expected %d latest-row exemplar notes but retrieved %d aligned rows.",
+            args.n_exemplars,
+            len(df_exemplars_raw),
+        )
         sys.exit(1)
 
     df_exemplars_raw["TEXT"] = df_exemplars_raw["TEXT"].apply(normalize_phi)

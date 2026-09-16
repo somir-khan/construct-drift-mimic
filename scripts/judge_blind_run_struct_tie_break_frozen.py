@@ -1,5 +1,5 @@
 """
-scripts/judge_llm_v2.py
+judge_blind_run_struct_tie_break_frozen.py
 Judge LLM — Semantic Drift Classification
 
 For each discharge note selected by select_judge_samples.py, reads the full
@@ -14,19 +14,16 @@ Drift taxonomy:
     3. Unresolved        — unexplained semantic distance; escalation signal
 
 Usage:
-    python scripts/judge_llm_v2.py
-    python scripts/judge_llm_v2.py --model gemma4:26b
-    python scripts/judge_llm_v2.py \\
-        --samples-csv data/judge_samples.csv \\
-        --results-csv data/judge_results_v2.csv
+    python judge_blind_run_struct_tie_break_frozen.py \\
+        --samples-csv data/judge_samples_300.csv \\
+        --results-csv data/judge_blind_struct_tie_break_results.csv \\
+        --ollama-host http://127.0.0.1:<dynamically-selected-port>
 
-v2 changes: adds secondary_evidence field to capture lexical signals
-even when primary classification is Structural Drift. Prompt updated
-to force explicit lexical checking before finalising classification.
-
-v3 changes: tie-breaking rule reversed — equal structural and lexical
-signals now resolve to Lexical Drift (v2 preferred Structural Drift).
-Default results file is judge_results_v3.csv. All other logic identical.
+This is the frozen blind Judge configuration. It uses the Structural Drift
+tie-break only when structural and lexical evidence are equally persuasive
+within a single model response. Across the five stochastic calls, a tied
+modal vote is resolved in the fixed order Structural Drift, Lexical Drift,
+then Unresolved; the temperature-0 call is diagnostic only.
 """
 
 import argparse
@@ -37,14 +34,12 @@ import os
 import re
 import sys
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
 from dotenv import load_dotenv
 from tqdm import tqdm
 
 import ollama
-
 from ollama import Client
 load_dotenv()
 
@@ -56,6 +51,11 @@ VALID_CATEGORIES = frozenset([
     "Lexical Drift",
     "Unresolved",
 ])
+TIE_BREAK_ORDER = ("Structural Drift", "Lexical Drift", "Unresolved")
+# Tokenizer-verified maximum Judge prompt: 23,921 tokens (three exemplars plus
+# the longest audit note). This fixed context window leaves ample room for the
+# required JSON response on the A100 80GB deployment.
+JUDGE_NUM_CTX = 65536
 
 RESULTS_FIELDNAMES = [
     "hadm_id",
@@ -72,6 +72,9 @@ RESULTS_FIELDNAMES = [
     "deterministic_reasoning",
     "deterministic_secondary_evidence",
     "stable",
+    "run_categories",
+    "category_counts",
+    "verdict_resolution",
     "note_length",
     "error",
 ]
@@ -101,13 +104,23 @@ def parse_args():
     )
     parser.add_argument(
         "--samples-csv",
-        default="data/judge_samples.csv",
-        help="Input CSV produced by select_judge_samples.py.",
+        default="data/judge_samples_300.csv",
+        help="Frozen input CSV produced by select_judge_samples.py.",
     )
     parser.add_argument(
         "--results-csv",
-        default="data/judge_results_v3.csv",
-        help="Output CSV path (opened in append mode for resumability).",
+        default="data/judge_blind_struct_tie_break_results.csv",
+        help="New output CSV path. Existing files require --resume.",
+    )
+    parser.add_argument(
+        "--incomplete-csv",
+        default=None,
+        help="Audit log for unresolved technical failures. Defaults to RESULTS_CSV.incomplete.csv.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only an interrupted run produced by this script.",
     )
     parser.add_argument(
         "--model",
@@ -127,15 +140,6 @@ def parse_args():
         help="Number of independent LLM calls per note; modal category is retained.",
     )
     parser.add_argument(
-        "--surface-stats-csv",
-        default="outputs/surface_features_by_period.csv",
-        help=(
-            "CSV produced by surface_features.py. Used to inject window-level "
-            "surface statistics into the Judge LLM system prompt. If the file "
-            "does not exist, the prompt will note that statistics are unavailable."
-        ),
-    )
-    parser.add_argument(
         "--call-timeout",
         type=int,
         default=300,
@@ -146,13 +150,9 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--baseline-label",
-        default="MIMIC-III",
-        help=(
-            "period_label value in surface_features_by_period.csv that identifies "
-            "the MIMIC-III baseline row. Used to read baseline section_rate and "
-            "mean_length dynamically rather than relying on hardcoded constants."
-        ),
+        "--ollama-host",
+        required=True,
+        help="Ollama endpoint for this run; must be supplied explicitly by the launcher.",
     )
     parser.add_argument(
         "--temperature",
@@ -175,60 +175,7 @@ def normalize_phi(text: str) -> str:
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
-def build_surface_context(
-    anchor_year_group: str,
-    surface_stats: dict,
-    baseline_stats: dict | None = None,
-) -> str:
-    """
-    Format window-level surface feature statistics for injection into
-    the Judge LLM system prompt.
-
-    Args:
-        anchor_year_group: str, e.g. '2017 - 2019'
-        surface_stats:     dict with keys matching F1-F5 feature names for
-                           the target window. If empty or None, returns a
-                           fallback string.
-        baseline_stats:    dict for the MIMIC-III baseline row, read from
-                           surface_features_by_period.csv. Used to populate
-                           the (baseline: ...) annotations. Falls back to
-                           'N/A' if not supplied.
-
-    Returns:
-        Formatted string block for insertion into the system prompt.
-    """
-    if not surface_stats:
-        return (
-            f"  Window: {anchor_year_group}\n"
-            "  (Surface feature statistics not available for this window.)"
-        )
-
-    section_rate    = surface_stats.get("section_rate", "N/A")
-    jaccard         = surface_stats.get("jaccard", "N/A")
-    mean_length     = surface_stats.get("mean_length", "N/A")
-    numeric_density = surface_stats.get("numeric_density", "N/A")
-
-    bl = baseline_stats or {}
-    bl_section_rate = bl.get("section_rate", "N/A")
-    bl_jaccard      = bl.get("jaccard", "N/A")
-    bl_mean_length  = bl.get("mean_length", "N/A")
-
-    def fmt(v, decimals=3):
-        return f"{v:.{decimals}f}" if isinstance(v, float) else str(v)
-
-    return (
-        f"  Window: {anchor_year_group}\n"
-        f"  Structured section rate : {fmt(section_rate)} "
-        f"(baseline: {fmt(bl_section_rate)})\n"
-        f"  Vocabulary Jaccard      : {fmt(jaccard)} "
-        f"(baseline: {fmt(bl_jaccard)})\n"
-        f"  Mean note length (chars): {fmt(mean_length, 0)} "
-        f"(baseline: {fmt(bl_mean_length, 0)})\n"
-        f"  Numeric token density   : {fmt(numeric_density)} "
-    )
-
-
-def build_system_prompt(exemplar_block: str, surface_context: str = "") -> str:
+def build_system_prompt(exemplar_block: str) -> str:
     return (
         "<|think|>\n"
         "You are a clinical NLP auditor evaluating why a hospital discharge "
@@ -236,31 +183,22 @@ def build_system_prompt(exemplar_block: str, surface_context: str = "") -> str:
         "2001-2012). Distributional drift has already been detected statistically. "
         "Your job is attribution — explaining what observable properties of the "
         "note account for that distance.\n\n"
-        "WINDOW CONTEXT (aggregate statistics for the temporal window this note "
-        "was drawn from):\n"
-        + surface_context +
-        "\n\nUse these statistics as background context when interpreting the "
-        "note below. They describe the window, not this specific note. Your "
-        "classification must be grounded in what you observe in the note text "
-        "itself. Do not simply echo the window statistics back as your reasoning.\n\n"
         "Classify the note into exactly one of these three categories:\n\n"
         "1. \"Structural Drift\" — The note's distance from the baseline is "
         "primarily explained by formatting and template changes: standardized "
         "section headers, altered document structure, length expansion consistent "
-        "with template adoption. The window-level section rate and length "
-        "statistics support this explanation.\n\n"
+        "with template adoption.\n\n"
         "2. \"Lexical Drift\" — The note's distance from the baseline is primarily "
         "explained by vocabulary and terminology differences: unfamiliar clinical "
-        "terms, changed phrasing conventions, new abbreviations. The window-level "
-        "Jaccard drop supports this explanation. You do not need to identify why "
-        "vocabulary changed — only that it has.\n\n"
+        "terms, changed phrasing conventions, new abbreviations. You do not need to identify "
+        "why vocabulary changed — only that it has.\n\n"
         "3. \"Unresolved\" — The note feels semantically distant from the baseline "
         "exemplars, but neither structural nor lexical patterns adequately explain "
         "that distance. Flag specifically what you observe that cannot be attributed "
         "to the known surface patterns. This is an escalation signal.\n\n"
         "TIE-BREAKING RULE: If the note shows both structural and lexical signals, "
         "classify by whichever is more prominent. If they are equal, prefer "
-        "Lexical Drift. Reserve Unresolved strictly for notes where neither "
+        "Structural Drift. Reserve Unresolved strictly for notes where neither "
         "category provides an adequate explanation.\n\n"
         "LEXICAL CHECK — before finalising any classification, explicitly scan "
         "the note for: unfamiliar clinical terminology, new abbreviations, changed "
@@ -273,16 +211,15 @@ def build_system_prompt(exemplar_block: str, surface_context: str = "") -> str:
         "not a drift signal.\n"
         + exemplar_block +
         "\n\nOutput ONLY a raw JSON object with exactly four keys:\n"
-        "- \"category\": one of [\"Structural Drift\", \"Lexical Drift\", "
-        "\"Unresolved\"]\n"
+        "- \"category\": one of [\"Structural Drift\", \"Lexical Drift\", \"Unresolved\"]\n"
         "- \"confidence\": one of [\"High\", \"Medium\", \"Low\"]\n"
-        "- \"reasoning\": 1-2 sentences explaining your primary classification, "
-        "citing specific evidence from the note text\n"
-        "- \"secondary_evidence\": 1-2 sentences describing any lexical signals "
-        "observed (unfamiliar terms, new abbreviations, changed phrasing), or "
-        "the string 'none' if no lexical divergence is detected\n\n"
-        "Do not output any preamble, markdown code fences, or text outside "
-        "the JSON object."
+        "- \"reasoning\": 1-2 sentences explaining your primary classification, citing\n"
+        "  specific evidence from the note text\n"
+        "- \"secondary_evidence\": 1-2 sentences describing any lexical signals observed\n"
+        "  (unfamiliar terms, new abbreviations, changed phrasing), or the string 'none'\n"
+        "  if no lexical divergence is detected\n\n"
+        "Do not output any preamble, markdown code fences, or text outside the JSON\n"
+        "object."
     )
 
 # ---------------------------------------------------------------------------
@@ -341,20 +278,22 @@ def _parse_response(raw_text):
 
     return None
 
-
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
-def _single_classify_attempt(model, messages, max_retries, temperature, call_timeout=7200):
+def _single_classify_attempt(
+    model, messages, max_retries, temperature, call_timeout=300,
+    ollama_host=None,
+):
     raw_response = ""
-    client = Client(host='http://localhost:11434', timeout=call_timeout)
+    client = Client(host=ollama_host, timeout=call_timeout)
 
     for attempt in range(1, max_retries + 1):
         try:
             response = client.chat(
                 model=model,
                 messages=messages,
-                options={"temperature": temperature, "num_ctx": 32768},
+                options={"temperature": temperature, "num_ctx": JUDGE_NUM_CTX},
             )
             raw_response = response.message.content
 
@@ -372,8 +311,10 @@ def _single_classify_attempt(model, messages, max_retries, temperature, call_tim
     return {"category": "", "confidence": "", "reasoning": "",
             "secondary_evidence": ""}, raw_response
 
-
-def _deterministic_classify(model, messages, max_retries, call_timeout=300):
+def _deterministic_classify(
+    model, messages, max_retries, call_timeout=300,
+    ollama_host=None,
+):
     """
     Run a single classification at temperature=0 for a deterministic
     reasoning field. Used after modal category is established from
@@ -388,10 +329,14 @@ def _deterministic_classify(model, messages, max_retries, call_timeout=300):
         max_retries=max_retries,
         temperature=0.0,
         call_timeout=call_timeout,
+        ollama_host=ollama_host,
     )
 
 
-def classify_note(model, messages, max_retries, n_runs=5, temperature=0.7, call_timeout=300):
+def classify_note(
+    model, messages, max_retries, n_runs=5, temperature=0.7,
+    call_timeout=300, ollama_host=None,
+):
     """Call the Ollama LLM n_runs times and return the modal classification.
 
     Args:
@@ -409,37 +354,56 @@ def classify_note(model, messages, max_retries, n_runs=5, temperature=0.7, call_
     all_results = []
     for _ in range(n_runs):
         result, error = _single_classify_attempt(
-            model, messages, max_retries, temperature, call_timeout,
+            model, messages, max_retries, temperature, call_timeout, ollama_host,
         )
         if result["category"]:
             all_results.append(result)
 
-    if not all_results:
+    run_categories = [r["category"] for r in all_results]
+    if len(all_results) != n_runs:
         return {
             "category": "", "confidence": "", "reasoning": "",
             "secondary_evidence": "",
-            "consistency_rate": 0.0, "n_valid_runs": 0,
+            "consistency_rate": 0.0, "n_valid_runs": len(all_results),
             "deterministic_category": "",
             "deterministic_reasoning": "",
             "deterministic_secondary_evidence": "",
             "stable": None,
-        }, "all_runs_failed"
+            "run_categories": json.dumps(run_categories),
+            "category_counts": json.dumps(dict(Counter(run_categories)), sort_keys=True),
+            "verdict_resolution": "",
+        }, "fewer_than_five_valid_stochastic_runs"
 
-    # Modal category
+    # The five stochastic calls determine the verdict. A tied modal vote is
+    # resolved by a fixed pre-specified category order; temperature 0 remains
+    # a diagnostic for every note.
     category_counts = Counter(r["category"] for r in all_results)
-    modal_category  = category_counts.most_common(1)[0][0]
+    max_count = max(category_counts.values())
+    modal_categories = sorted(
+        category for category, count in category_counts.items() if count == max_count
+    )
+
+    det_result, _ = _deterministic_classify(
+        model, messages, max_retries, call_timeout, ollama_host,
+    )
+    det_category = det_result.get("category", "")
+    det_reasoning = det_result.get("reasoning", "")
+    det_secondary = det_result.get("secondary_evidence", "none")
+
+    if len(modal_categories) == 1:
+        modal_category = modal_categories[0]
+        verdict_resolution = "unique_modal"
+    else:
+        modal_category = min(modal_categories, key=TIE_BREAK_ORDER.index)
+        verdict_resolution = "stochastic_tie_break"
+    stable = (det_category == modal_category) if det_category else None
+
     consistency     = category_counts[modal_category] / n_runs
 
     # Reasoning from highest-confidence modal run (temp=0.7)
     conf_order = {"High": 3, "Medium": 2, "Low": 1}
     modal_results = [r for r in all_results if r["category"] == modal_category]
     best_result   = max(modal_results, key=lambda r: conf_order.get(r["confidence"], 0))
-
-    # Deterministic run at temperature=0 for stable reasoning field
-    det_result, det_error = _deterministic_classify(model, messages, max_retries, call_timeout)
-    det_category  = det_result.get("category", "")
-    det_reasoning = det_result.get("reasoning", "")
-    stable        = (det_category == modal_category) if det_category else None
 
     return {
         "category":                        best_result["category"],
@@ -450,8 +414,11 @@ def classify_note(model, messages, max_retries, n_runs=5, temperature=0.7, call_
         "n_valid_runs":                    len(all_results),
         "deterministic_category":          det_category,
         "deterministic_reasoning":         det_reasoning,
-        "deterministic_secondary_evidence": det_result.get("secondary_evidence", "none"),
+        "deterministic_secondary_evidence": det_secondary,
         "stable":                          stable,
+        "run_categories":                  json.dumps(run_categories),
+        "category_counts":                 json.dumps(dict(category_counts), sort_keys=True),
+        "verdict_resolution":              verdict_resolution,
     }, ""
 
 
@@ -479,106 +446,148 @@ def load_samples(samples_csv):
     return df
 
 
+def validate_frozen_manifest(df_samples):
+    """Fail fast unless the input is the frozen 300-note audit manifest."""
+    valid_groups = {"exemplar", "top", "bottom", "random"}
+    unexpected = set(df_samples["selection_group"].dropna()) - valid_groups
+    if unexpected:
+        sys.exit("Unexpected selection_group value(s): " + ", ".join(sorted(unexpected)))
+
+    exemplars = df_samples[df_samples["selection_group"] == "exemplar"].copy()
+    audit = df_samples[df_samples["selection_group"].isin({"top", "bottom", "random"})].copy()
+    nonempty_text = (
+        df_samples["text"].notna()
+        & df_samples["text"].astype(str).str.strip().ne("")
+    )
+    if len(exemplars) != 3 or not nonempty_text.loc[exemplars.index].all():
+        sys.exit("Frozen Judge run requires exactly three nonempty baseline exemplars.")
+    if (
+        len(audit) != 300
+        or audit["hadm_id"].duplicated().any()
+        or not nonempty_text.loc[audit.index].all()
+    ):
+        sys.exit("Frozen Judge run requires 300 unique top/random/bottom audit notes with nonempty text.")
+
+    expected_cohorts = {"2014 - 2016", "2017 - 2019"}
+    observed_cohorts = set(audit["anchor_year_group"].astype(str).str.strip())
+    if observed_cohorts != expected_cohorts:
+        sys.exit("Manifest does not contain the expected two anchor-year-group cohorts.")
+
+    counts = audit.groupby(["anchor_year_group", "selection_group"]).size()
+    for cohort in expected_cohorts:
+        for arm in ("top", "bottom", "random"):
+            if int(counts.get((cohort, arm), 0)) != 50:
+                sys.exit(f"Manifest requires 50 {arm} notes in cohort {cohort}.")
+    return exemplars, audit
+
+
+def write_incomplete_record(path, row, result, error_code):
+    """Keep an audit trail without placing incomplete rows in the results file."""
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=RESULTS_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "hadm_id": row.hadm_id,
+            "anchor_year_group": getattr(row, "anchor_year_group", ""),
+            "selection_group": row.selection_group,
+            "witness_score": row.witness_score,
+            "category": result.get("category", ""),
+            "confidence": result.get("confidence", ""),
+            "reasoning": result.get("reasoning", ""),
+            "secondary_evidence": result.get("secondary_evidence", ""),
+            "consistency_rate": result.get("consistency_rate", ""),
+            "n_valid_runs": result.get("n_valid_runs", ""),
+            "deterministic_category": result.get("deterministic_category", ""),
+            "deterministic_reasoning": result.get("deterministic_reasoning", ""),
+            "deterministic_secondary_evidence": result.get("deterministic_secondary_evidence", ""),
+            "stable": result.get("stable", ""),
+            "run_categories": result.get("run_categories", ""),
+            "category_counts": result.get("category_counts", ""),
+            "verdict_resolution": result.get("verdict_resolution", ""),
+            "note_length": result.get("note_length", 0),
+            "error": error_code,
+        })
+
+
+def validate_frozen_configuration(args):
+    """Prevent accidental changes to the frozen primary Judge settings."""
+    if args.model != "gemma4:26b":
+        sys.exit("Frozen primary Judge run requires --model gemma4:26b.")
+    if args.n_runs != 5:
+        sys.exit("Frozen primary Judge run requires exactly five stochastic runs.")
+    if args.temperature != 0.7:
+        sys.exit("Frozen primary Judge run requires --temperature 0.7.")
+    if args.max_retries != 3:
+        sys.exit("Frozen primary Judge run requires --max-retries 3.")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
     """Orchestrate LLM drift classification for all selected discharge notes."""
     args = parse_args()
+    validate_frozen_configuration(args)
 
     # --- Stage 1: Load Inputs -----------------------------------------------
     log.info("--- Stage 1: Load Judge Samples ---")
     df_samples = load_samples(args.samples_csv)
     log.info("%d samples loaded from %s", len(df_samples), args.samples_csv)
 
-    # Split exemplars from rows to classify
-    df_exemplars = df_samples[df_samples["selection_group"] == "exemplar"].copy()
-    df_classify  = df_samples[df_samples["selection_group"] != "exemplar"].copy()
+    df_exemplars, df_classify = validate_frozen_manifest(df_samples)
+    parts = []
+    for i, (_, erow) in enumerate(df_exemplars.iterrows(), start=1):
+        text_snippet = str(erow.get("text", ""))
+        parts.append(
+            f"--- MIMIC-III Baseline Exemplar {i} (hadm_id={erow['hadm_id']}) ---\n"
+            f"{text_snippet}"
+        )
+    exemplar_block = (
+        "\n\nTo ground your reference frame, the following are three discharge notes "
+        "representative of the MIMIC-III (2001-2012) documentation era. These are "
+        "provided as baseline context only — do not classify them:\n\n"
+        + "\n\n".join(parts)
+    )
+    log.info("Validated frozen manifest and loaded %d baseline exemplars.", len(df_exemplars))
 
-    if len(df_exemplars) == 0:
-        log.warning(
-            "No exemplar rows found in %s. Judge LLM will run without baseline "
-            "exemplars in the system prompt. Re-run select_judge_samples.py to "
-            "generate exemplars.",
-            args.samples_csv,
-        )
-        exemplar_block = ""
-    else:
-        parts = []
-        for i, (_, erow) in enumerate(df_exemplars.iterrows(), start=1):
-            text_snippet = str(erow.get("text", ""))
-            parts.append(
-                f"--- MIMIC-III Baseline Exemplar {i} (hadm_id={erow['hadm_id']}) ---\n"
-                f"{text_snippet}"
-            )
-        exemplar_block = (
-            "\n\nTo ground your reference frame, the following are three discharge notes "
-            "representative of the MIMIC-III (2001-2012) documentation era. These are "
-            "provided as baseline context only — do not classify them:\n\n"
-            + "\n\n".join(parts)
-        )
-        log.info("Loaded %d exemplar notes for system prompt.", len(df_exemplars))
-
-    # --- Stage 1b: Load Surface Feature Statistics --------------------------
-    log.info("--- Stage 1b: Load Surface Feature Statistics ---")
-    surface_stats_by_window = {}
-    if os.path.exists(args.surface_stats_csv):
-        df_surf = pd.read_csv(args.surface_stats_csv)
-        for _, srow in df_surf.iterrows():
-            window = str(srow.get("period_label", srow.get("anchor_year_group", ""))).strip()
-            if window:
-                surface_stats_by_window[window] = {
-                    "section_rate":      srow.get("section_rate", None),
-                    "jaccard":           srow.get("jaccard", None),
-                    "mean_length":       srow.get("mean_length", None),
-                    "numeric_density":   srow.get("numeric_density", None),
-                    "phi_density":       srow.get("phi_density", None),
-                }
-        log.info(
-            "Surface stats loaded for %d windows: %s",
-            len(surface_stats_by_window),
-            list(surface_stats_by_window.keys()),
-        )
-    else:
-        log.warning(
-            "Surface stats file not found: %s — prompts will lack window "
-            "statistics. Run surface_features.py first.",
-            args.surface_stats_csv,
-        )
-
-    baseline_stats = surface_stats_by_window.get(args.baseline_label, {})
-    if baseline_stats:
-        log.info(
-            "Baseline stats (%s): section_rate=%.3f  mean_length=%.0f",
-            args.baseline_label,
-            baseline_stats.get("section_rate", float("nan")),
-            baseline_stats.get("mean_length", float("nan")),
-        )
-    else:
-        log.warning(
-            "Baseline label '%s' not found in surface stats — baseline "
-            "annotations in system prompt will show N/A. Check "
-            "--baseline-label matches the period_label column in %s.",
-            args.baseline_label, args.surface_stats_csv,
-        )
-
-    # Build one system prompt per temporal window, each with its own
-    # surface feature context block injected.
-    unique_windows = df_classify["anchor_year_group"].unique().tolist()
-    system_prompts_by_window = {}
-    for window in unique_windows:
-        stats  = surface_stats_by_window.get(str(window).strip(), {})
-        ctx    = build_surface_context(str(window), stats, baseline_stats)
-        system_prompts_by_window[window] = build_system_prompt(exemplar_block, ctx)
-        log.info("System prompt built for window: %s", window)
+    # Generate the single, static system prompt
+    system_prompt = build_system_prompt(exemplar_block)
+    log.info("System prompt built.")
 
     # --- Stage 2: Resume Check ----------------------------------------------
     log.info("--- Stage 2: Resume Check ---")
     done_ids = set()
     if os.path.exists(args.results_csv) and os.path.getsize(args.results_csv) > 0:
+        if not args.resume:
+            sys.exit(
+                f"Results file already exists: {args.results_csv}. Use a new path or --resume."
+            )
         df_done = pd.read_csv(args.results_csv)
-        done_ids = set(df_done["hadm_id"].tolist())
-        log.info("%d notes already classified — skipping.", len(done_ids))
+        required_output = {"hadm_id", "category", "n_valid_runs", "verdict_resolution", "error"}
+        missing_output = required_output - set(df_done.columns)
+        if missing_output:
+            sys.exit("Existing results file is not compatible with this frozen script: "
+                     + ", ".join(sorted(missing_output)))
+        complete = (
+            df_done["error"].fillna("").eq("")
+            & df_done["category"].isin(VALID_CATEGORIES)
+            & pd.to_numeric(df_done["n_valid_runs"], errors="coerce").eq(args.n_runs)
+            & df_done["verdict_resolution"].isin(
+                {"unique_modal", "stochastic_tie_break"}
+            )
+        )
+        if not complete.all() or df_done["hadm_id"].duplicated().any():
+            sys.exit("Existing results contain incomplete or duplicate rows; use a new output path.")
+        done_ids = set(df_done["hadm_id"].astype("int64").tolist())
+        manifest_ids = set(df_classify["hadm_id"].astype("int64").tolist())
+        if not done_ids <= manifest_ids:
+            sys.exit("Existing results contain hadm_id values outside the frozen manifest.")
+        log.info("%d completed notes found — resuming.", len(done_ids))
 
     df_todo = df_classify[~df_classify["hadm_id"].isin(done_ids)].reset_index(drop=True)
     log.info("%d notes remaining to classify.", len(df_todo))
@@ -590,11 +599,11 @@ def main():
     # --- Stage 3: Validate Ollama Connection --------------------------------
     log.info("--- Stage 3: Validate Ollama Connection ---")
     try:
-        _ping_client = Client(host='http://localhost:11434', timeout=args.call_timeout)
+        _ping_client = Client(host=args.ollama_host, timeout=args.call_timeout)
         _ping_client.chat(
             model=args.model,
             messages=[{"role": "user", "content": "ping"}],
-            options={"num_ctx": 32768},
+            options={"num_ctx": JUDGE_NUM_CTX},
         )
         log.info("Ollama connection OK (model: %s)", args.model)
     except Exception as exc:
@@ -607,10 +616,8 @@ def main():
 
     # --- Stage 4: Classify Notes --------------------------------------------
     log.info("--- Stage 4: Classify Notes ---")
-    write_header = (
-        not os.path.exists(args.results_csv)
-        or os.path.getsize(args.results_csv) == 0
-    )
+    write_header = not os.path.exists(args.results_csv) or os.path.getsize(args.results_csv) == 0
+    incomplete_csv = args.incomplete_csv or f"{args.results_csv}.incomplete.csv"
 
     out_dir = os.path.dirname(args.results_csv)
     if out_dir:
@@ -629,38 +636,11 @@ def main():
                 note_text = None
 
             if note_text is None:
-                log.warning(
-                    "[%d/%d] hadm_id=%d — note text missing in samples CSV.",
-                    idx + 1, len(df_todo), row.hadm_id,
-                )
-                writer.writerow({
-                    "hadm_id":                            row.hadm_id,
-                    "anchor_year_group":                  getattr(row, "anchor_year_group", ""),
-                    "selection_group":                    row.selection_group,
-                    "witness_score":                      row.witness_score,
-                    "category":                           "",
-                    "confidence":                         "",
-                    "reasoning":                          "",
-                    "secondary_evidence":                 "",
-                    "consistency_rate":                   "",
-                    "n_valid_runs":                       "",
-                    "deterministic_category":             "",
-                    "deterministic_reasoning":            "",
-                    "deterministic_secondary_evidence":   "",
-                    "stable":                             "",
-                    "note_length":                        0,
-                    "error":                              "note_not_found",
-                })
-                fh.flush()
-                continue
+                write_incomplete_record(incomplete_csv, row, {"note_length": 0}, "note_not_found")
+                sys.exit(f"Audit incomplete: hadm_id={row.hadm_id} has no note text.")
 
             note_text = str(note_text)
             note_text = normalize_phi(note_text)
-            window        = getattr(row, "anchor_year_group", "")
-            system_prompt = system_prompts_by_window.get(
-                window,
-                build_system_prompt(exemplar_block)   # fallback if window missing
-            )
             messages  = _build_messages(note_text, system_prompt)
 
             try:
@@ -668,6 +648,7 @@ def main():
                     args.model, messages, args.max_retries,
                     n_runs=args.n_runs, temperature=args.temperature,
                     call_timeout=args.call_timeout,
+                    ollama_host=args.ollama_host,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.error(
@@ -675,6 +656,14 @@ def main():
                     row.hadm_id, exc,
                 )
                 sys.exit(1)
+
+            if error_str:
+                result["note_length"] = len(note_text)
+                write_incomplete_record(incomplete_csv, row, result, error_str)
+                sys.exit(
+                    f"Audit incomplete: hadm_id={row.hadm_id} ({error_str}). "
+                    f"Details written to {incomplete_csv}."
+                )
 
             writer.writerow({
                 "hadm_id":                            row.hadm_id,
@@ -691,6 +680,9 @@ def main():
                 "deterministic_reasoning":            result.get("deterministic_reasoning", ""),
                 "deterministic_secondary_evidence":   result.get("deterministic_secondary_evidence", "none"),
                 "stable":                             result.get("stable", ""),
+                "run_categories":                    result.get("run_categories", ""),
+                "category_counts":                   result.get("category_counts", ""),
+                "verdict_resolution":                result.get("verdict_resolution", ""),
                 "note_length":                        len(note_text),
                 "error":                              error_str,
             })
@@ -710,6 +702,8 @@ def main():
     n_total   = len(df_results)
     n_success = int((df_results["error"].fillna("") == "").sum())
     n_errors  = n_total - n_success
+    if n_total != len(df_classify) or n_success != len(df_classify):
+        sys.exit("Audit incomplete: results do not contain one completed row per audit note.")
 
     log.info("=" * 55)
     log.info("  JUDGE LLM CLASSIFICATION COMPLETE")
@@ -720,7 +714,7 @@ def main():
     log.info("=" * 55)
 
     if n_success > 0:
-        df_ok = df_results[df_results["error"] == ""]
+        df_ok = df_results[df_results["error"].fillna("") == ""]
 
         log.info("Category breakdown by selection group:")
         log.info("\n%s", pd.crosstab(df_ok["selection_group"], df_ok["category"]).to_string())

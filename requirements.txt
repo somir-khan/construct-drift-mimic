@@ -1,14 +1,23 @@
-pandas
-numpy
-scikit-learn
-torch
-transformers
-matplotlib
-seaborn
-torchdrift
-dataeval
-# For Judge LLM if needed later
-openai
-ollama
-python-dotenv
-PyPDF2
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+transformers==5.3.0
+joblib==1.6.0
+tqdm==4.67.3
+python-dotenv==1.2.2
+PyYAML==6.0.3
+scipy==1.17.1
+
+# if you're installing on a CPU-only machine and don't want the ~5GB of CUDA
+# runtime libraries pulled in unnecessarily, comment this line out first:
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.10.0
+
+cloudpickle==3.1.2
+ollama==0.6.1
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# Drift-detection baselines
+torchdrift==0.1.0.post1
+dataeval==1.0.3
