@@ -372,16 +372,39 @@ def assert_primary_reproduction(components: int, statistic: float) -> None:
         raise ProtocolError("Primary reproduction failed: " + "; ".join(failures))
 
 
-def fixed_nested_permutations(
+def fixed_separate_subsamples(
     baseline_n: int,
     target_n: int,
     seed: int,
+    sample_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """One fixed RNG per seed; prefixes create the prespecified nested samples."""
-    rng = np.random.default_rng(seed)
-    baseline_order = rng.permutation(baseline_n)
-    target_order = rng.permutation(target_n)
-    return baseline_order, target_order
+    """Draw one deterministic subset for a specific seed-size cell.
+
+    The ``sample_size`` is part of the seed sequence, so the 500-, 1,000-, and
+    2,000-note subsets are sampled separately rather than constructed as
+    prefixes of one permutation.  Baseline and target also receive separate
+    child streams.  Each draw is without replacement within its corpus;
+    natural overlap across sample-size cells is allowed and expected.
+    """
+    if sample_size < 1:
+        raise ProtocolError("sample_size must be positive")
+    if sample_size > baseline_n or sample_size > target_n:
+        raise ProtocolError(
+            "sample_size exceeds a source corpus: "
+            f"sample_size={sample_size}, baseline_n={baseline_n}, "
+            f"target_n={target_n}"
+        )
+
+    seed_sequence = np.random.SeedSequence([seed, sample_size])
+    baseline_sequence, target_sequence = seed_sequence.spawn(2)
+    baseline_rng = np.random.default_rng(baseline_sequence)
+    target_rng = np.random.default_rng(target_sequence)
+
+    baseline_indices = baseline_rng.choice(
+        baseline_n, size=sample_size, replace=False
+    )
+    target_indices = target_rng.choice(target_n, size=sample_size, replace=False)
+    return baseline_indices, target_indices
 
 
 def permutation_test_precomputed(

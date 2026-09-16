@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ from _ae5a_common import (
     atomic_write_text,
     dynamic_pca,
     environment_versions,
-    fixed_nested_permutations,
+    fixed_separate_subsamples,
     load_analysis_arrays,
     median_sigma,
     mmd2_unbiased,
@@ -130,6 +131,7 @@ def validate_results(
     factor_rows: list[dict[str, object]],
     sample_rows: list[dict[str, object]],
     summary_rows: list[dict[str, object]],
+    overlap_rows: list[dict[str, object]],
     exceedances: int,
     masked_p_text: str,
 ) -> None:
@@ -168,8 +170,33 @@ def validate_results(
     if observed_pairs != expected_pairs or len(sample_rows) != len(expected_pairs):
         raise ProtocolError("Sample-size grid changed")
     for row in sample_rows:
-        if row["nested_within_seed"] is not True:
-            raise ProtocolError("A sample-size row is not marked nested")
+        if row["sampling_design"] != "separate_without_replacement":
+            raise ProtocolError("A sample-size row has the wrong sampling design")
+        if row["deliberately_nested_across_sample_sizes"] is not False:
+            raise ProtocolError("A sample-size row is marked deliberately nested")
+
+    expected_overlap_keys = {
+        (seed, size_a, size_b)
+        for seed in SAMPLE_SEEDS
+        for size_a, size_b in combinations(SAMPLE_SIZES, 2)
+    }
+    observed_overlap_keys = {
+        (int(row["seed"]), int(row["size_a"]), int(row["size_b"]))
+        for row in overlap_rows
+    }
+    if (
+        observed_overlap_keys != expected_overlap_keys
+        or len(overlap_rows) != len(expected_overlap_keys)
+    ):
+        raise ProtocolError("Sample-size overlap diagnostic grid changed")
+    for row in overlap_rows:
+        if row["deliberately_nested"] is not False:
+            raise ProtocolError("An overlap row is marked deliberately nested")
+        smaller = int(row["size_a"])
+        for field in ("baseline_overlap", "target_overlap"):
+            overlap = int(row[field])
+            if overlap < 0 or overlap > smaller:
+                raise ProtocolError(f"Invalid {field}={overlap}")
     expected_summary_sizes = [*SAMPLE_SIZES, EXPECTED_N]
     if [
         int(row["sample_size_per_corpus"]) for row in summary_rows
@@ -232,6 +259,29 @@ def render_reports(result: dict) -> tuple[str, str]:
         ]
         for row in result["sample_size_summary"]
     ]
+    overlap_rows = []
+    for size_a, size_b in combinations(SAMPLE_SIZES, 2):
+        selected = [
+            row
+            for row in result["sample_size_overlap_diagnostics"]
+            if row["size_a"] == size_a and row["size_b"] == size_b
+        ]
+        baseline_overlap = [int(row["baseline_overlap"]) for row in selected]
+        target_overlap = [int(row["target_overlap"]) for row in selected]
+        overlap_rows.append(
+            [
+                f"{size_a:,} vs {size_b:,}",
+                f"{selected[0]['expected_overlap_per_corpus']:.0f}",
+                (
+                    f"{np.median(baseline_overlap):g} "
+                    f"[{min(baseline_overlap)}, {max(baseline_overlap)}]"
+                ),
+                (
+                    f"{np.median(target_overlap):g} "
+                    f"[{min(target_overlap)}, {max(target_overlap)}]"
+                ),
+            ]
+        )
     window_rows = [
         [
             cell["setting"],
@@ -263,9 +313,15 @@ def render_reports(result: dict) -> tuple[str, str]:
 
 ## Sample size
 
-The 500, 1,000, and 2,000 rows summarize 20 nested draws from the independent primary baseline and target arrays. Their IQRs are stability summaries, not confidence intervals. The 5,000 row is the single frozen primary result.
+For each of 20 seeds and each sample size, a separate random subset was drawn without replacement from the frozen 5,000-note baseline and target corpora. Subsets were not deliberately nested across sample sizes, although natural overlap can occur because all draws come from the same fixed corpora. Their IQRs are stability summaries, not confidence intervals. The 5,000 row is the single frozen primary result.
 
 {markdown_table(['n per corpus', 'Runs', 'Components median [range]', 'Sigma median [IQR]', 'MMD squared median [IQR]', 'Change vs primary'], sample_rows)}
+
+### Subset-overlap diagnostic
+
+Expected overlap under separate sampling is $n_a n_b / 5{{,}}000$. Observed columns report the median [minimum, maximum] across the 20 seeds.
+
+{markdown_table(['Size comparison', 'Expected per corpus', 'Baseline overlap', 'Target overlap'], overlap_rows)}
 
 ## Window-stratified comparison
 
@@ -324,6 +380,7 @@ def main() -> None:
         "factor_cells": results_dir / "ae5a_factor_cells.csv",
         "sample_runs": results_dir / "ae5a_sample_size_runs.csv",
         "sample_summary": results_dir / "ae5a_sample_size_summary.csv",
+        "sample_overlap": results_dir / "ae5a_sample_size_overlap_diagnostics.csv",
         "null": results_dir / "masked_mean_permutation_null.npy",
         "json": results_dir / "ae5a_results.json",
         "markdown": report_dir / "AE5A_RESULTS.md",
@@ -441,13 +498,14 @@ def main() -> None:
         )
 
     sample_rows: list[dict[str, object]] = []
+    overlap_rows: list[dict[str, object]] = []
     for seed in SAMPLE_SEEDS:
-        baseline_order, target_order = fixed_nested_permutations(
-            len(baseline), len(target), seed
-        )
+        indices_by_size: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for sample_size in SAMPLE_SIZES:
-            baseline_indices = baseline_order[:sample_size]
-            target_indices = target_order[:sample_size]
+            baseline_indices, target_indices = fixed_separate_subsamples(
+                len(baseline), len(target), seed, sample_size
+            )
+            indices_by_size[sample_size] = (baseline_indices, target_indices)
             left, right, pca, sample_retained = dynamic_pca(
                 baseline[baseline_indices], target[target_indices], 0.90
             )
@@ -464,7 +522,30 @@ def main() -> None:
                     "percent_change_from_primary": percent_change(
                         statistic, primary_mmd2
                     ),
-                    "nested_within_seed": True,
+                    "sampling_design": "separate_without_replacement",
+                    "deliberately_nested_across_sample_sizes": False,
+                }
+            )
+
+        for size_a, size_b in combinations(SAMPLE_SIZES, 2):
+            baseline_a, target_a = indices_by_size[size_a]
+            baseline_b, target_b = indices_by_size[size_b]
+            baseline_overlap = int(np.intersect1d(baseline_a, baseline_b).size)
+            target_overlap = int(np.intersect1d(target_a, target_b).size)
+            expected_overlap = size_a * size_b / len(baseline)
+            overlap_rows.append(
+                {
+                    "seed": seed,
+                    "size_a": size_a,
+                    "size_b": size_b,
+                    "expected_overlap_per_corpus": expected_overlap,
+                    "baseline_overlap": baseline_overlap,
+                    "target_overlap": target_overlap,
+                    "baseline_fraction_of_smaller": baseline_overlap / size_a,
+                    "target_fraction_of_smaller": target_overlap / size_a,
+                    "baseline_fully_nested": baseline_overlap == size_a,
+                    "target_fully_nested": target_overlap == size_a,
+                    "deliberately_nested": False,
                 }
             )
 
@@ -496,7 +577,10 @@ def main() -> None:
                 "pca_components_median": float(np.median(components)),
                 "pca_components_min": min(components),
                 "pca_components_max": max(components),
-                "dependency_note": "nested within seed; IQR is not a confidence interval",
+                "dependency_note": (
+                    "separate seed-size draws; natural overlap may occur; "
+                    "IQR is not a confidence interval"
+                ),
             }
         )
     summary_rows.append(
@@ -554,10 +638,15 @@ def main() -> None:
     )
 
     validate_results(
-        factor_rows, sample_rows, summary_rows, exceedances, masked_p_text
+        factor_rows,
+        sample_rows,
+        summary_rows,
+        overlap_rows,
+        exceedances,
+        masked_p_text,
     )
     result = {
-        "schema": "ae5a-sensitivity-results-minimal-v3",
+        "schema": "ae5a-sensitivity-results-minimal-v4",
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
         "analysis_inputs": analysis_input_paths(args),
         "primary_reproduction": {
@@ -574,8 +663,16 @@ def main() -> None:
             "target_device": masked_target_meta["device"],
         },
         "factor_cells": factor_rows,
+        "sample_size_design": {
+            "sampling": "separate_without_replacement",
+            "seeds": list(SAMPLE_SEEDS),
+            "sample_sizes_per_corpus": list(SAMPLE_SIZES),
+            "deliberately_nested_across_sample_sizes": False,
+            "natural_overlap_across_sample_sizes_allowed": True,
+        },
         "sample_size_summary": summary_rows,
         "sample_size_runs_count": len(sample_rows),
+        "sample_size_overlap_diagnostics": overlap_rows,
         "masked_mean_permutation": {
             "n_permutations": N_PERMUTATIONS,
             "exceedances": exceedances,
@@ -604,6 +701,9 @@ def main() -> None:
     atomic_write_csv(paths["sample_runs"], list(sample_rows[0].keys()), sample_rows)
     atomic_write_csv(
         paths["sample_summary"], list(summary_rows[0].keys()), summary_rows
+    )
+    atomic_write_csv(
+        paths["sample_overlap"], list(overlap_rows[0].keys()), overlap_rows
     )
     atomic_save_npy(paths["null"], null)
     atomic_write_json(paths["json"], result)
