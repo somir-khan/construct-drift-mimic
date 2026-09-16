@@ -240,8 +240,9 @@ the frozen sensitivity analysis.
 
 ## Experiment C: detector comparison
 
-Experiment C compares the framework with DriftLens and MCD-DD using prepared
-baseline, calibration, and target arrays.
+Experiment C compares the framework with DriftLens and MCD-DD on the same
+primary 5,000-note MIMIC-III baseline and 5,000-note MIMIC-IV target used for
+the framework's MMD result (MMD² = 0.072665).
 
 Prepare the inputs:
 
@@ -249,8 +250,9 @@ Prepare the inputs:
 python scripts/experiment_c/experiment_c_prepare.py \
     --baseline-emb data/embeddings/embeddings_mimic3_5000.npy \
     --baseline-ids data/embeddings/ids_mimic3_5000.npy \
-    --target data/embeddings_windows/embeddings_mimic4_2500_2014_2016.npy data/embeddings_windows/ids_mimic4_2500_2014_2016.npy "2014 - 2016" \
-    --target data/embeddings_windows/embeddings_mimic4_2500_2017_2019.npy data/embeddings_windows/ids_mimic4_2500_2017_2019.npy "2017 - 2019" \
+    --target-emb data/embeddings/embeddings_mimic4_5000.npy \
+    --target-ids data/embeddings/ids_mimic4_5000.npy \
+    --target-groups data/embeddings/groups_mimic4_5000.npy \
     --m3-pool data/experiment_b_embeddings/embeddings_m3_train_47723.npy data/experiment_b_embeddings/ids_m3_train_47723.npy \
     --m3-pool data/experiment_b_embeddings/embeddings_m3_dev_1631.npy data/experiment_b_embeddings/ids_m3_dev_1631.npy \
     --m3-pool data/experiment_b_embeddings/embeddings_m3_test_3372.npy data/experiment_b_embeddings/ids_m3_test_3372.npy \

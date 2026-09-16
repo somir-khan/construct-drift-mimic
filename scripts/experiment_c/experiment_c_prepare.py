@@ -2,7 +2,7 @@
 """Prepare only the three arrays needed by the minimal Experiment C.
 
 B     : exact frozen 5,000-note MIMIC-III baseline
-T     : exact frozen 5,000-note MIMIC-IV target
+T     : exact frozen primary 5,000-note MIMIC-IV target (the framework's MMD target)
 C_cal : MIMIC-III calibration pool for DriftLens, patient-disjoint from B
 
 The script does not construct null cohorts and does not load the framework PCA.
@@ -24,7 +24,6 @@ import numpy as np
 
 
 COHORT_SIZE = 5_000
-TARGET_PART_SIZE = 2_500
 EMBEDDING_DIM = 768
 
 
@@ -32,13 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-emb", required=True)
     parser.add_argument("--baseline-ids", required=True)
+    parser.add_argument("--target-emb", required=True, help="Primary 5,000-note MIMIC-IV embeddings.")
+    parser.add_argument("--target-ids", required=True, help="HADM_IDs aligned with --target-emb.")
     parser.add_argument(
-        "--target",
-        action="append",
-        nargs=3,
+        "--target-groups",
         required=True,
-        metavar=("EMBEDDINGS", "IDS", "LABEL"),
-        help="Repeat exactly twice: one entry for each frozen MIMIC-IV cohort.",
+        help="anchor_year_group labels aligned with --target-emb (groups_mimic4_5000.npy).",
     )
     parser.add_argument(
         "--m3-pool",
@@ -125,8 +123,6 @@ def main() -> None:
     args = parse_args()
     if not args.mimic3_db:
         raise SystemExit("Provide --mimic3-db or set MIMIC3_DB_PATH.")
-    if len(args.target) != 2:
-        raise ValueError("Provide exactly two --target entries (2,500 rows each).")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -139,21 +135,20 @@ def main() -> None:
     if len(baseline) != COHORT_SIZE:
         raise ValueError(f"Baseline must have {COHORT_SIZE} rows; got {len(baseline)}.")
 
-    target_parts: list[np.ndarray] = []
-    target_id_parts: list[np.ndarray] = []
-    target_group_parts: list[np.ndarray] = []
-    for emb_path, ids_path, label in args.target:
-        part, part_ids = load_pair(emb_path, ids_path, f"target {label}")
-        if len(part) != TARGET_PART_SIZE:
-            raise ValueError(f"Target {label!r} must have {TARGET_PART_SIZE} rows; got {len(part)}.")
-        target_parts.append(part)
-        target_id_parts.append(part_ids)
-        target_group_parts.append(np.repeat(label, len(part)))
-    target = np.concatenate(target_parts)
-    target_ids = np.concatenate(target_id_parts)
-    target_groups = np.concatenate(target_group_parts)
-    if len(np.unique(target_ids)) != COHORT_SIZE:
-        raise ValueError("The two target components overlap in HADM_ID.")
+    target, target_ids = load_pair(args.target_emb, args.target_ids, "primary MIMIC-IV target")
+    if len(target) != COHORT_SIZE:
+        raise ValueError(f"Target must have {COHORT_SIZE} rows; got {len(target)}.")
+    try:
+        target_groups = np.load(args.target_groups, allow_pickle=False)
+    except ValueError as exc:
+        raise TypeError(
+            "--target-groups must be a plain string array (saved without pickled objects)."
+        ) from exc
+    target_groups = np.asarray(target_groups).reshape(-1).astype(str)
+    if len(target_groups) != COHORT_SIZE:
+        raise ValueError(f"--target-groups has {len(target_groups)} labels; expected {COHORT_SIZE}.")
+    if np.any(np.char.strip(target_groups) == "") or np.any(np.isin(target_groups, ["None", "nan"])):
+        raise ValueError("--target-groups contains empty or missing labels.")
 
     pool_parts: list[np.ndarray] = []
     pool_id_parts: list[np.ndarray] = []
@@ -214,7 +209,7 @@ def main() -> None:
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "construction": {
             "baseline": "exact frozen MIMIC-III baseline; no resampling",
-            "target": "two exact frozen 2,500-note MIMIC-IV cohorts concatenated in command order",
+            "target": "exact frozen primary 5,000-note MIMIC-IV target used for the framework MMD; no resampling",
             "calibration": (
                 "all MIMIC-III pool rows after sorting by HADM_ID and excluding every "
                 "subject represented in the baseline"

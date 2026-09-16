@@ -64,6 +64,16 @@ def main() -> None:
     later_false_alarm_total = sum(
         int(row["metrics"]["later_post_boundary_alarm_count"]) for row in ordered
     )
+    # Exact-zero score and threshold steps, computed from this run's records.
+    zero_steps_by_seed = {
+        int(row["seed"]): sum(
+            float(step["adjacent_score"]) == 0.0 and float(step["threshold"]) == 0.0
+            for step in row["steps"]
+        )
+        for row in ordered
+    }
+    zero_step_total = sum(zero_steps_by_seed.values())
+    zero_step_runs = sum(count > 0 for count in zero_steps_by_seed.values())
 
     fdd = float(driftlens["fdd"])
     threshold = float(driftlens["threshold"]["value"])
@@ -80,7 +90,7 @@ def main() -> None:
         },
         {
             "Dimension": "Interpretive artifact",
-            "Framework": "Witness ranking and blinded cause taxonomy",
+            "Framework": "Witness ranking and blinded cause taxonomy, both computed on the two anchor-year cohorts",
             "DriftLens": "K-means prototype examples (qualitative only)",
             "MCD-DD": "Per-sub-window score and threshold trajectory",
         },
@@ -114,6 +124,9 @@ def main() -> None:
             "runs_with_pre_boundary_false_alarm": pre_alarm_runs,
             "total_pre_boundary_false_alarms": pre_alarm_total,
             "runs_with_later_post_boundary_false_alarm": later_false_alarm_runs,
+            "runs_with_exact_zero_score_and_threshold_steps": zero_step_runs,
+            "total_exact_zero_score_and_threshold_steps": zero_step_total,
+            "exact_zero_score_and_threshold_steps_by_seed": zero_steps_by_seed,
             "total_later_post_boundary_false_alarms": later_false_alarm_total,
             "primary_endpoint": "alarm on exact first target sub-window [5000,5100)",
             "all_prespecified_seeds_retained": True,
@@ -170,7 +183,7 @@ def main() -> None:
             f"- MCD-DD exact-boundary detections: {boundary_hits}/20; all 20 prespecified seeds are retained.",
             f"- MCD-DD pre-boundary false alarms: {pre_alarm_total} across {pre_alarm_runs}/20 runs.",
             f"- MCD-DD later post-boundary false alarms: {later_false_alarm_total} across {later_false_alarm_runs}/20 runs.",
-            "- Sustained exact-zero score/threshold sequences were observed in some runs; they remain included as observed implementation behavior and no filtered denominator is calculated.",
+            f"- MCD-DD steps with exact-zero score and threshold: {zero_step_total} across {zero_step_runs}/20 runs; all runs remain included and no filtered denominator is calculated.",
             "- No confidence interval is calculated: the 20 seeds are stability replicates of one transition.",
             "",
         ]

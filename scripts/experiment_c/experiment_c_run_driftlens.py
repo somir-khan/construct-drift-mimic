@@ -326,7 +326,7 @@ def main() -> None:
     result = {
         "method": "DriftLens per-batch path",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "comparison": "frozen 5,000-note MIMIC-III baseline vs frozen pooled 5,000-note MIMIC-IV target",
+        "comparison": "frozen primary 5,000-note MIMIC-III baseline vs frozen primary 5,000-note MIMIC-IV target",
         "fdd": target_distance,
         "threshold": threshold,
         "drift_detected": bool(target_distance > float(threshold["value"])),
